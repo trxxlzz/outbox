@@ -5,18 +5,23 @@ import (
 	"github.com/redis/go-redis/v9"
 	"log"
 	"outbox/internal/config"
-	"outbox/internal/infra"
-	"outbox/internal/infra/kafka"
+	kafkaInfra "outbox/internal/infra/kafka"
 	"outbox/internal/infra/postgres"
+	redis2 "outbox/internal/infra/redis"
+	txRepo "outbox/internal/repository/transaction"
 	"outbox/internal/service/transaction"
-	"outbox/internal/transport"
-	txRepo "outbox/repository/transaction"
+	kafkaTransport "outbox/internal/transport/kafka"
+	redisTransport "outbox/internal/transport/redis"
+	"time"
 )
 
 func main() {
 	ctx := context.Background()
 
 	cfg, err := config.LoadConfig("config/.env", "postgres")
+	if err != nil {
+		log.Fatal("Failed to load config:", err)
+	}
 
 	dbpool, err := postgres.NewDBConnection(ctx, cfg.DSN())
 	if err != nil {
@@ -26,7 +31,7 @@ func main() {
 	log.Println("Successfully connected to database")
 
 	// Подключаем Kafka
-	kafkaWriter := kafka.NewKafkaWriter(cfg.KafkaBrokersList(), cfg.KafkaTopic)
+	kafkaWriter := kafkaInfra.NewKafkaWriter(cfg.KafkaBrokersList(), cfg.KafkaTopic)
 	defer kafkaWriter.Close()
 	log.Println("Successfully connected to Kafka")
 
@@ -42,17 +47,19 @@ func main() {
 	repo := txRepo.NewTransactionRepository(dbpool)
 
 	// Создаём Kafka продюсер
-	producer := infra.NewKafkaProducer(kafkaWriter)
+	producer := kafkaTransport.NewKafkaProducer(kafkaWriter)
 
 	// Создаём бизнес-слой
-	service := transaction.NewTransactionService(repo, producer)
+	service := transaction.NewTransactionService(repo, producer, dbpool)
+
+	go service.StartOutboxWorker(ctx, 2*time.Second)
 
 	// Создаём Redis consumer
-	redisConsumer := infra.NewRedisConsumer(redisClient, "transactions", "tx_group", "consumer1")
+	redisConsumer := redis2.NewRedisConsumer(redisClient, "transactions", "tx_group", "consumer1")
 
-	// Запускаем transport-слой
-	err = transport.StartConsumer(ctx, redisConsumer, service)
+	// Запуск transport-слоя (слушаем Redis и вызываем бизнес-логику)
+	err = redisTransport.StartRedisListener(ctx, redisConsumer, service)
 	if err != nil {
-		log.Fatalf("Failed to start consumer: %v", err)
+		log.Fatalf("Failed to start Redis listener: %v", err)
 	}
 }
